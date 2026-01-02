@@ -1,0 +1,264 @@
+-- [Matcha LuaVM] Ball Landing Prediction + Tracers
+-- Implements physics-based landing prediction with manual math and state management.
+-- STRICT: No events, no Raycast, uses spawn/wait, manual vector math.
+-- ADDED: Trajectory Tracers using object pooling (Drawing.new("Line")).
+
+local game = game
+local workspace = game:GetService("Workspace")
+local camera = workspace.CurrentCamera
+
+-- // 1. MANUAL MATH HELPERS //
+-- Matcha docs warn about broken Vector3 metamethods. We implement manual Lerp to be safe.
+local function vec3_lerp(a, b, alpha)
+    local x = a.X + (b.X - a.X) * alpha
+    local y = a.Y + (b.Y - a.Y) * alpha
+    local z = a.Z + (b.Z - a.Z) * alpha
+    return Vector3.new(x, y, z)
+end
+
+-- WTS Helper to handle environment differences and manual Vector2 creation
+local function safe_wts(pos3d)
+    if WorldToScreen then
+        return WorldToScreen(pos3d)
+    else
+        local vector, visible = camera:WorldToScreenPoint(pos3d)
+        return Vector2.new(vector.X, vector.Y), visible
+    end
+end
+
+-- // 2. PREDICTION STATE & LOGIC //
+-- Persistent variables for the prediction engine
+local prevT = nil
+local prevBallPos = nil
+local vSmooth = Vector3.new(0, 0, 0)
+local prevVy = nil
+local aYSmooth = -196.2 -- Fallback gravity (Roblox standard)
+
+-- The Core Prediction Function (Adapted strictly from prompt pseudocode)
+local function predictLanding(tNow, ballPos, shadowPos, shadowSizeX)
+    if not prevT then
+        prevT = tNow
+        prevBallPos = ballPos
+        vSmooth = Vector3.new(0, 0, 0)
+        aYSmooth = -196.2 -- fallback guess
+        return nil
+    end
+
+    local dt = tNow - prevT
+    if dt <= 1e-4 then return nil end
+
+    -- Velocity from position diff
+    local v = (ballPos - prevBallPos) / dt
+    local alpha = 0.35
+    vSmooth = vec3_lerp(vSmooth, v, alpha) -- Use manual lerp
+
+    -- Ground plane from shadow (or fallback if shadow is dummy)
+    local groundY = shadowPos.Y 
+
+    -- Vertical accel estimation
+    local vy = vSmooth.Y
+    local ay = (vy - (prevVy or vy)) / dt
+    prevVy = vy
+    aYSmooth = aYSmooth + 0.2 * (ay - aYSmooth) -- smooth
+
+    -- Choose contact y
+    local yContact = groundY
+
+    -- Solve: 0.5 * a * t^2 + vy * t + (y0 - yContact) = 0
+    local y0 = ballPos.Y
+    local a = 0.5 * aYSmooth
+    local b = vy
+    local c = y0 - yContact
+
+    local D = b*b - 4*a*c
+    if D < 0 or math.abs(a) < 1e-6 then 
+        -- Update prevT before returning to ensure dt calculates correctly next frame
+        prevT = tNow
+        prevBallPos = ballPos
+        return nil 
+    end
+
+    local sqrtD = math.sqrt(D)
+    local t1 = (-b - sqrtD) / (2*a)
+    local t2 = (-b + sqrtD) / (2*a)
+
+    local tHit = math.huge
+    if t1 > 0 then tHit = math.min(tHit, t1) end
+    if t2 > 0 then tHit = math.min(tHit, t2) end
+    
+    if tHit == math.huge then 
+        prevT = tNow
+        prevBallPos = ballPos
+        return nil 
+    end
+
+    local landX = ballPos.X + vSmooth.X * tHit
+    local landZ = ballPos.Z + vSmooth.Z * tHit
+    local landPos = Vector3.new(landX, yContact, landZ)
+
+    -- Update state for next frame
+    prevT = tNow
+    prevBallPos = ballPos
+
+    return landPos, tHit
+end
+
+-- // 3. VISUALS & TRACER POOL //
+-- "Object Management: Store your Drawing objects in a table/tree structure."
+-- "Do NOT destroy/recreate them every frame."
+
+-- Landing Circle
+local pred_circle = Drawing.new("Circle")
+pred_circle.Visible = false
+pred_circle.Color = Color3.fromRGB(0, 255, 0) -- Green
+pred_circle.Thickness = 2
+pred_circle.NumSides = 32
+pred_circle.Radius = 20
+pred_circle.Filled = true
+pred_circle.Transparency = 0.6
+
+-- Tracer Pool
+local TRACER_SEGMENTS = 20 -- How many lines to make up the curve
+local tracer_pool = {}
+
+for i = 1, TRACER_SEGMENTS do
+    local line = Drawing.new("Line")
+    line.Visible = false
+    line.Color = Color3.fromRGB(255, 255, 255) -- White tracers for contrast
+    line.Thickness = 1
+    line.Transparency = 0.8
+    table.insert(tracer_pool, line)
+end
+
+-- Tracer Update Logic
+local function update_tracers(active, startPos, velocity, accelY, totalTime)
+    if not active then
+        for i = 1, #tracer_pool do
+            tracer_pool[i].Visible = false
+        end
+        return
+    end
+
+    -- We calculate 'TRACER_SEGMENTS' points along the curve
+    local step = totalTime / TRACER_SEGMENTS
+    local prev3D = startPos
+    
+    -- We must ensure the first point is strictly on-screen or valid before starting
+    -- but calculating just the segments is safer.
+    
+    local t_accum = 0
+
+    for i = 1, TRACER_SEGMENTS do
+        local line = tracer_pool[i]
+        t_accum = t_accum + step
+        
+        -- Physics Formula: P = P0 + v*t + 0.5*a*t^2 (Vector separation)
+        -- Y-Axis (Quadratic with Gravity)
+        local y = startPos.Y + (velocity.Y * t_accum) + (0.5 * accelY * t_accum * t_accum)
+        -- X/Z Axis (Linear assumption based on current script logic)
+        local x = startPos.X + (velocity.X * t_accum)
+        local z = startPos.Z + (velocity.Z * t_accum)
+        
+        local next3D = Vector3.new(x, y, z)
+        
+        -- Convert both to screenspace
+        local p1, v1 = safe_wts(prev3D)
+        local p2, v2 = safe_wts(next3D)
+        
+        if v1 and v2 then
+            line.From = p1
+            line.To = p2
+            line.Visible = true
+        else
+            line.Visible = false
+        end
+        
+        prev3D = next3D
+    end
+end
+
+-- // 4. BALL FINDER LOGIC //
+local function find_active_ball()
+    -- Re-fetch children every call due to Matcha's volatile caching
+    local children = workspace:GetChildren()
+    
+    for i = 1, #children do
+        local obj = children[i]
+        if obj then
+            local name = obj.Name
+            -- Strict Name Prefix Check
+            if string.sub(name, 1, 11) == "CLIENT_BALL" then
+                -- Anti-Player Filter: Ensure it's not a character
+                if not obj:FindFirstChildOfClass("Humanoid") then
+                    -- Return the MeshPart visual if possible
+                    if obj:IsA("Model") or obj:IsA("Folder") then
+                         local mesh = obj:FindFirstChildWhichIsA("MeshPart", true)
+                         if mesh then return mesh end
+                    elseif obj:IsA("MeshPart") then
+                        return obj
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- // 5. MAIN LOOP //
+spawn(function()
+    print("[Matcha] Starting Ball Prediction Engine with Tracers...")
+    
+    while true do
+        -- A. Fetch Fresh Data
+        local ball = find_active_ball()
+        
+        if ball then
+            -- B. Locate Shadow / Determine Ground Height
+            local shadow = nil
+            if ball.Parent then
+                shadow = ball.Parent:FindFirstChild("Shadow") or ball:FindFirstChild("Shadow")
+            end
+            
+            local shadowPos
+            local shadowSizeX = 1
+            
+            if shadow then
+                shadowPos = shadow.Position
+                shadowSizeX = shadow.Size.X
+            else
+                shadowPos = Vector3.new(ball.Position.X, 0, ball.Position.Z)
+            end
+
+            -- C. Run Prediction
+            local landPos, timeToLand = predictLanding(os.clock(), ball.Position, shadowPos, shadowSizeX)
+
+            -- D. Update Visuals
+            if landPos then
+                -- 1. Update Circle
+                local pos_2d, on_screen = safe_wts(landPos)
+
+                if on_screen then
+                    pred_circle.Position = pos_2d
+                    pred_circle.Visible = true
+                else
+                    pred_circle.Visible = false
+                end
+                
+                -- 2. Update Tracers (Pass the physics state used for this prediction)
+                -- We use the current ball position as P0, and the smoothed velocity/accel
+                update_tracers(true, ball.Position, vSmooth, aYSmooth, timeToLand)
+            else
+                pred_circle.Visible = false
+                update_tracers(false)
+            end
+        else
+            -- Reset state if ball is lost
+            prevT = nil
+            vSmooth = Vector3.new(0, 0, 0)
+            pred_circle.Visible = false
+            update_tracers(false)
+        end
+
+        wait() -- Standard wait
+    end
+end)
