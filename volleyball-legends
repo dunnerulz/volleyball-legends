@@ -1,15 +1,17 @@
 -- [Matcha LuaVM] Ultimate Volleyball Script
--- Combined: Ball Prediction + Advanced Enemy Tracers (Gaze Only)
+-- Combined: Ball Prediction + Advanced Enemy Tracers + Hitbox Expander
 -- STRICT: No events, manual memory reading, robust math.
--- UPDATED: Adaptive Gravity (Fixes "Curving down too soon").
--- NOTE: Gravity is now auto-calculated to match the game's specific physics.
--- FIXED: Artifacts when tracers go off-screen (Strict visibility check).
+-- UPDATED: Added Hitbox Expander (Client-Sided).
+-- NOTE: Gravity is auto-calculated (Adaptive).
+-- FIXED: Artifacts when tracers go off-screen.
 -- FIXED: Runtime Error "compare number < nil" due to broken .Magnitude property.
+-- FIXED: "index nil with FindFirstChild" by locally caching volatile instances.
 
 local game = game
 local workspace = game:GetService("Workspace")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage") -- Added for Hitbox Expander
 local Camera = workspace.CurrentCamera
 local LocalPlayer = Players.LocalPlayer
 
@@ -18,7 +20,7 @@ local SETTINGS = {
     -- Player ESP Settings
     EspEnabled = true,
     TracerLength = 15,
-    EspColor = Color3.fromRGB(255, 255, 255),       -- Normal Color
+    EspColor = Color3.fromRGB(255, 255, 255),
     EspThickness = 1.5,
     EspTransparency = 1.0,
     
@@ -26,8 +28,10 @@ local SETTINGS = {
     RefreshRate = 0.010, 
     GracePeriod = 0.05,
 
-    -- Physics
-    -- Removed fixed 'Gravity' setting. Script now learns gravity dynamically.
+    -- Hitbox Expander Settings
+    HitboxExpander = true,
+    HitboxSize = 5,
+    HitboxRefresh = 0.5 -- How often to re-apply size (seconds)
 }
 
 -- // 1. MEMORY CONFIGURATION //
@@ -36,7 +40,6 @@ local OFFSET_PRIMITIVE = 0x148
 
 -- // 2. HELPERS & MATH //
 local function safe_wts(pos3d)
-    -- Wrapper to handle Matcha WorldToScreen or Roblox API
     if WorldToScreen then
         return WorldToScreen(pos3d)
     else
@@ -60,8 +63,8 @@ end
 -- // 3. BALL PREDICTION VARIABLES //
 local prevPhysicsTime = 0
 local prevBallPos = nil
-local prevVelocityY = nil -- Used to calculate acceleration
-local smoothAccelY = -80  -- Start with a "floaty" guess (low gravity), it will adapt quickly.
+local prevVelocityY = nil 
+local smoothAccelY = -80  
 local vSmooth = Vector3.new(0, 0, 0)
 
 -- // 4. PLAYER ESP VARIABLES //
@@ -69,14 +72,10 @@ local TracerData = {}
 local HeadCache = {} 
 
 -- // 5. MEMORY FUNCTIONS //
-
--- Reads the 3rd Column (BackVector) directly from the Primitive pointer
 local function HeadMemoryWorker(instanceAddress)
     local primitiveAddress = memory_read("uintptr_t", instanceAddress + OFFSET_PRIMITIVE)
     if not primitiveAddress or primitiveAddress == 0 then return nil end
 
-    -- Reading Column 2 (BackVector components)
-    -- Matrix layout: R00..R02, R10..R12, R20..R22
     local r02 = memory_read("float", primitiveAddress + OFFSET_CFRAME + 0x08)
     local r12 = memory_read("float", primitiveAddress + OFFSET_CFRAME + 0x14)
     local r22 = memory_read("float", primitiveAddress + OFFSET_CFRAME + 0x20)
@@ -84,23 +83,14 @@ local function HeadMemoryWorker(instanceAddress)
     return r02, r12, r22
 end
 
--- Calculates LookVector from the read BackVector
 local function GetLookVectorFromMemory(instanceAddress)
     if not instanceAddress or instanceAddress == 0 then return nil end
-
     local success, r02, r12, r22 = pcall(HeadMemoryWorker, instanceAddress)
-
-    if not success or not r02 or not r12 or not r22 then
-        return nil
-    end
-
-    -- LookVector is the negative of the BackVector
+    if not success or not r02 or not r12 or not r22 then return nil end
     return Vector3.new(-r02, -r12, -r22)
 end
 
 -- // 7. VISUAL MANAGEMENT //
-
--- Ball Visuals Pool
 local RING_SEGMENTS = 32
 local RING_RADIUS = 5
 local ring_pool = {}
@@ -118,22 +108,14 @@ for i = 1, BALL_TRACER_SEGMENTS do
     table.insert(ball_tracer_pool, line)
 end
 
--- Player ESP Management
 local function CreateTracerEntry(playerName, playerInstance)
     if TracerData[playerName] then return TracerData[playerName] end
-
     local line = Drawing.new("Line")
     line.Visible = false
     line.Color = SETTINGS.EspColor
     line.Thickness = SETTINGS.EspThickness
     line.Transparency = SETTINGS.EspTransparency
-    
-    local entry = {
-        Line = line,
-        LastUpdate = 0,
-        PlayerInstance = playerInstance
-    }
-    
+    local entry = { Line = line, LastUpdate = 0, PlayerInstance = playerInstance }
     TracerData[playerName] = entry
     return entry
 end
@@ -142,10 +124,7 @@ local function RemoveTracer(playerName)
     local entry = TracerData[playerName]
     if entry then
         if entry.Line then entry.Line:Remove() end
-        
-        if entry.PlayerInstance then
-            HeadCache[entry.PlayerInstance] = nil
-        end
+        if entry.PlayerInstance then HeadCache[entry.PlayerInstance] = nil end
         TracerData[playerName] = nil
     end
 end
@@ -154,59 +133,38 @@ end
 
 -- Ball Prediction
 local function predictLanding(tNow, ballPos, shadowPos, shadowSizeX)
-    -- 1. Initialize State
     if not prevBallPos then
         prevBallPos = ballPos; prevPhysicsTime = tNow; vSmooth = Vector3.new(0, 0, 0); prevVelocityY = nil
         return nil, nil
     end
 
-    -- 2. Physics Throttling & Teleport Detection
-    -- We only update velocity if enough time has passed (approx 30Hz or 0.03s).
     local dt = tNow - prevPhysicsTime
-    
     if dt >= 0.03 then 
         local diff = ballPos - prevBallPos
         local dist = v3_mag(diff)
         
-        -- Teleport Check: If ball moves > 50 units instantly, it's a respawn/teleport.
         if dist > 50 then
             prevBallPos = ballPos; prevPhysicsTime = tNow; vSmooth = Vector3.new(0, 0, 0); prevVelocityY = nil
             return nil, nil
         end
         
         local v = diff / dt
-        
-        -- Adaptive Gravity Logic:
-        -- Calculate instantaneous acceleration: (v2 - v1) / dt
         if prevVelocityY then
             local accelInst = (v.Y - prevVelocityY) / dt
-            
-            -- Filter: Only update gravity if acceleration is negative (falling/rising normally).
-            -- If accel is huge positive, it implies a bounce/collision, which we ignore for gravity calc.
-            -- Also clamp to reasonable bounds (-250 to -10) to prevent glitches.
             if accelInst < -10 and accelInst > -250 then
-                -- Smooth lerp (0.1) to find the game's true gravity over a few frames
                 smoothAccelY = smoothAccelY + 0.1 * (accelInst - smoothAccelY)
             end
         end
         prevVelocityY = v.Y
-
-        -- Smoothing V
         local alpha = 0.25
         vSmooth = vec3_lerp(vSmooth, v, alpha)
-        
         prevBallPos = ballPos
         prevPhysicsTime = tNow
     end
 
-    -- 3. Prediction Calculation (Using learned smoothAccelY)
-    
-    -- ADJUSTMENT: The shadow is visually offset by +5 units on the Y axis.
     local groundY = shadowPos.Y - 5 
-    
     local vy = vSmooth.Y
-    local ay = smoothAccelY -- Use the learned gravity
-    
+    local ay = smoothAccelY 
     local yContact = groundY
     local y0 = ballPos.Y
     local a = 0.5 * ay
@@ -217,25 +175,20 @@ local function predictLanding(tNow, ballPos, shadowPos, shadowSizeX)
     if D < 0 then return nil, nil end 
 
     local sqrtD = math.sqrt(D)
-    
-    -- Quadratic Formula
     local t1 = (-b - sqrtD) / (2*a)
     local t2 = (-b + sqrtD) / (2*a)
-
     local tHit = math.huge
     if t1 > 0 then tHit = math.min(tHit, t1) end
     if t2 > 0 then tHit = math.min(tHit, t2) end
-    
     if tHit == math.huge then return nil, nil end
 
     local landX = ballPos.X + vSmooth.X * tHit
     local landZ = ballPos.Z + vSmooth.Z * tHit
     local landPos = Vector3.new(landX, yContact, landZ)
-
     return landPos, tHit
 end
 
--- Ball Visual Updates
+-- Visual Updates
 local function update_ball_ring(active, centerPos)
     if not active then
         for i = 1, #ring_pool do ring_pool[i].Visible = false end
@@ -304,109 +257,134 @@ local function find_active_ball()
     return nil
 end
 
--- Player ESP Logic
 local function UpdatePlayerESP()
     local currentPlayers = Players:GetChildren()
     local activePlayerNames = {} 
-
-    -- Fetch LocalPlayer Team for comparison
     local myTeam = nil
-    if LocalPlayer.Character then
-        myTeam = LocalPlayer.Character:GetAttribute("JerseyTeam")
+    
+    -- Local Cache for LocalPlayer Character
+    local lpChar = LocalPlayer.Character
+    if lpChar then
+        myTeam = lpChar:GetAttribute("JerseyTeam")
     end
     
     for _, player in pairs(currentPlayers) do
         if player.ClassName == "Player" then
             local pName = player.Name
             activePlayerNames[pName] = true 
-            
             if player ~= LocalPlayer and pName ~= LocalPlayer.Name then
                 local shouldDrawLine = false
-                
                 local entry = TracerData[pName] or CreateTracerEntry(pName, player)
                 local line = entry.Line
-
-                if player.Character then
-                    -- Team Check: Differentiate using "JerseyTeam" attribute
+                
+                -- Local Cache for Player Character to prevent "index nil" errors
+                local character = player.Character 
+                
+                if character then
                     local isEnemy = true
                     if myTeam then
-                         local pTeam = player.Character:GetAttribute("JerseyTeam")
-                         if pTeam and pTeam == myTeam then
-                             isEnemy = false
-                         end
+                         local pTeam = character:GetAttribute("JerseyTeam")
+                         if pTeam and pTeam == myTeam then isEnemy = false end
                     end
-
                     if isEnemy then
-                        -- Cache Head to avoid spamming FindFirstChild
                         local head = HeadCache[player]
-                        if not head or head.Parent ~= player.Character then
-                            head = player.Character:FindFirstChild("Head")
+                        -- Use cached 'character' variable here
+                        if not head or head.Parent ~= character then
+                            head = character:FindFirstChild("Head") -- Safe usage
                             HeadCache[player] = head
                         end
                         
-                        local lookVec = nil
-                        local headPos = nil
-                        
-                        -- Get Memory Data
+                        local lookVec, headPos = nil, nil
                         if head and head.Address ~= 0 then
                             lookVec = GetLookVectorFromMemory(head.Address)
                             headPos = head.Position
                         end
-
-                        -- TRACER LOGIC
                         if lookVec and headPos then
                             local endX = headPos.X + (lookVec.X * SETTINGS.TracerLength)
                             local endY = headPos.Y + (lookVec.Y * SETTINGS.TracerLength)
                             local endZ = headPos.Z + (lookVec.Z * SETTINGS.TracerLength)
                             local endPos = Vector3.new(endX, endY, endZ)
-
                             local screenStart, onScreenStart = safe_wts(headPos)
                             local screenEnd, onScreenEnd = safe_wts(endPos)
-
                             if onScreenStart and onScreenEnd then
-                                line.From = screenStart
-                                line.To = screenEnd
-                                shouldDrawLine = true
-                                entry.LastUpdate = os.clock()
+                                line.From = screenStart; line.To = screenEnd
+                                shouldDrawLine = true; entry.LastUpdate = os.clock()
                             end
                         end
                     end
                 else
-                    HeadCache[player] = nil
-                    shouldDrawLine = false
+                    HeadCache[player] = nil; shouldDrawLine = false
                 end
-
                 if shouldDrawLine then
                     if not line.Visible then line.Visible = true end
                 else
-                    if (os.clock() - entry.LastUpdate) > SETTINGS.GracePeriod then
-                        line.Visible = false
+                    if (os.clock() - entry.LastUpdate) > SETTINGS.GracePeriod then line.Visible = false end
+                end
+            end
+        end
+    end
+    for pName, _ in pairs(TracerData) do
+        if not activePlayerNames[pName] then RemoveTracer(pName) end
+    end
+end
+
+-- // 9. HITBOX EXPANDER LOGIC //
+local function resize_balls(size)
+    -- This function specifically targets the game's asset structure
+    local assets = ReplicatedStorage:FindFirstChild("Assets")
+    if not assets then return end
+    
+    local ball_folder = assets:FindFirstChild("Ball")
+    if not ball_folder then return end
+
+    pcall(function()
+        local children = ball_folder:GetChildren()
+        for _, model in ipairs(children) do
+            if model and model:IsA("Model") then
+                local descendants = model:GetDescendants()
+                for _, part in ipairs(descendants) do
+                    if part and part:IsA("MeshPart") then
+                        part.Size = Vector3.new(size, size, size)
                     end
                 end
             end
         end
-    end
-
-    -- Cleanup players who left
-    for pName, _ in pairs(TracerData) do
-        if not activePlayerNames[pName] then
-            RemoveTracer(pName)
-        end
-    end
+    end)
 end
 
--- // 9. MAIN LOOP //
-print("[Matcha] Script Loaded: Adaptive Gravity Prediction [v4]")
 
+-- // 10. MAIN LOOPS //
+print("[Matcha] Script Loaded: Adaptive Gravity + Hitbox Expander [v5]")
+
+-- Thread 1: Hitbox Expander (Runs independently)
 spawn(function()
     while true do
-        -- A. Ball Prediction Loop
+        if SETTINGS.HitboxExpander then
+            resize_balls(SETTINGS.HitboxSize)
+        end
+        wait(SETTINGS.HitboxRefresh)
+    end
+end)
+
+-- Thread 2: Prediction & Visuals
+spawn(function()
+    while true do
+        -- A. Ball Prediction
         local ball = find_active_ball()
         if ball then
+            -- Safe caching for Ball Parent
+            local ballParent = ball.Parent 
             local shadow = nil
-            if ball.Parent then
-                shadow = ball.Parent:FindFirstChild("Shadow") or ball:FindFirstChild("Shadow")
+            
+            if ballParent then
+                shadow = ballParent:FindFirstChild("Shadow") 
             end
+            
+            -- Fallback if parent has no shadow (or parent is nil/stale)
+            if not shadow then
+                shadow = ball:FindFirstChild("Shadow")
+            end
+            
             local shadowPos
             local shadowSizeX = 1
             if shadow then
@@ -415,40 +393,31 @@ spawn(function()
                 shadowPos = Vector3.new(ball.Position.X, 0, ball.Position.Z)
             end
             
-            -- Call updated predictLanding
             local landPos, timeToLand = predictLanding(os.clock(), ball.Position, shadowPos, shadowSizeX)
             
             if landPos then
                 update_ball_ring(true, landPos)
-                -- Pass smoothAccelY (adaptive gravity) to tracers
                 update_ball_tracers(true, ball.Position, vSmooth, smoothAccelY, timeToLand)
             else
                 update_ball_ring(false); update_ball_tracers(false)
             end
         else
-            -- Reset prediction state when ball is lost
-            prevPhysicsTime = 0
-            prevBallPos = nil 
-            vSmooth = Vector3.new(0, 0, 0)
-            prevVelocityY = nil
+            prevPhysicsTime = 0; prevBallPos = nil; vSmooth = Vector3.new(0, 0, 0); prevVelocityY = nil
             update_ball_ring(false); update_ball_tracers(false)
         end
 
-        -- B. Player ESP Loop
+        -- B. Player ESP
         local status, err = pcall(function()
             if SETTINGS.EspEnabled then
                 UpdatePlayerESP()
             else
-                -- Hide all if disabled
                 for _, entry in pairs(TracerData) do
                     if entry.Line.Visible then entry.Line.Visible = false end
                 end
             end
         end)
 
-        if not status then
-            warn("[ESP Error]: " .. tostring(err))
-        end
+        if not status then warn("[ESP Error]: " .. tostring(err)) end
 
         wait(SETTINGS.RefreshRate)
     end
